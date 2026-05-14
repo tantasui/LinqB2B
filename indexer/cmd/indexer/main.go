@@ -1,0 +1,321 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/alecthomas/kong"
+	"gorm.io/gorm"
+
+	"github.com/fystack/multichain-indexer/b2b-platform/internal/onboarding"
+	"github.com/fystack/multichain-indexer/b2b-platform/internal/worker"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/addressbloomfilter"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/common/config"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/common/logger"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/events"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/infra"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/kvstore"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/model"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/repository"
+)
+
+type CLI struct {
+	Index IndexCmd `cmd:"" help:"Start the multi-chain transaction indexer with configurable worker modes."`
+}
+
+type IndexCmd struct {
+	// Core configuration
+	ConfigPath string `help:"Path to configuration file containing chain and worker settings." default:"configs/config.yaml" short:"c" name:"config"`
+
+	// Chain selection
+	Chains []string `help:"Specific blockchain chains to index (comma-separated). If not specified, all configured chains will be indexed." sep:"," short:"n" name:"chains" placeholder:"ethereum,polygon"`
+
+	// Logging
+	Debug bool `help:"Enable debug-level logging for detailed troubleshooting information." short:"d" name:"debug"`
+
+	// Worker modes (these can override config settings)
+	EnableCatchup bool `help:"Enable catchup worker to process historical blocks alongside regular indexing. Overrides config setting." name:"catchup"`
+	EnableManual  bool `help:"Enable manual worker for processing specific block ranges via Redis queue. Overrides config setting."     name:"manual"`
+
+	// Block starting point
+	FromLatest bool `help:"Start indexing from the latest blockchain block instead of configured starting points. Useful for fresh deployments." name:"from-latest"`
+}
+
+func (c *IndexCmd) Run() error {
+	runIndexer(c.Chains, c.ConfigPath, c.Debug, c.EnableManual, c.EnableCatchup, c.FromLatest)
+	return nil
+}
+
+func main() {
+	var cli CLI
+	ctx := kong.Parse(
+		&cli,
+		kong.Name("transaction-indexer"),
+		kong.Description(
+			"Multi-chain blockchain transaction indexer with support for regular, catchup, manual, and rescanner worker modes.",
+		),
+		kong.UsageOnError(),
+		kong.Vars{
+			"version": "1.0.0", // You can add version info
+		},
+	)
+	err := ctx.Run()
+	ctx.FatalIfErrorf(err)
+}
+
+func runIndexer(chains []string, configPath string, debug, manual, catchup, fromLatest bool) {
+	ctx := context.Background()
+
+	level := slog.LevelInfo
+	if debug {
+		level = slog.LevelDebug
+	}
+	logger.Init(&logger.Options{
+		Level:      level,
+		TimeFormat: time.RFC3339,
+	})
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		logger.Fatal("Failed to load configuration",
+			"config_path", configPath,
+			"error", err.Error(),
+			"hint", "Check the config file syntax and structure")
+	}
+	logger.Info("Config loaded", "environment", cfg.Environment)
+
+	services := cfg.Services
+	// start redis
+	logger.Info(
+		"Connecting to redis",
+		"url",
+		services.Redis.URL,
+		"environment",
+		cfg.Environment,
+		"mtls",
+		services.Redis.MTLS,
+	)
+	redisClient, err := infra.NewRedisClient(
+		services.Redis.URL,
+		services.Redis.Password,
+		string(cfg.Environment),
+		services.Redis.MTLS,
+	)
+	if err != nil {
+		logger.Fatal("Create redis client failed", "err", err)
+	}
+	logger.Info("Redis connection established")
+
+	// start db (optional)
+	var db *gorm.DB
+	if services.Database != nil {
+		db, err = infra.NewDBConnection(services.Database.URL, string(cfg.Environment))
+		if err != nil {
+			logger.Fatal("Create db connection failed", "err", err)
+		}
+		logger.Info("Database connection established")
+	} else {
+		logger.Info("Database connection skipped - not configured")
+	}
+
+	// start kvstore
+	logger.Info("Connecting to kvstore", "url", services.KVS.Consul.Address)
+	kvstore, err := kvstore.NewFromConfig(services.KVS)
+	if err != nil {
+		logger.Fatal("Create kvstore failed", "err", err)
+	}
+	defer kvstore.Close()
+
+	logger.Info("Connecting to NATS", "url", services.Nats.URL)
+	natsConn, err := infra.GetNATSConnection(services.Nats, string(cfg.Environment))
+	if err != nil {
+		logger.Fatal("Create NATS connection failed", "err", err)
+	}
+	defer natsConn.Close()
+	logger.Info("NATS connection established")
+
+	eventQueueManager := infra.NewNATsMessageQueueManager("transfer", []string{
+		"transfer.event.*",
+	}, natsConn)
+	eventQueue := eventQueueManager.NewMessageQueue("dispatch")
+
+	utxoQueueManager := infra.NewNATsMessageQueueManager("utxo", []string{
+		"utxo.event.*",
+	}, natsConn)
+	utxoQueue := utxoQueueManager.NewMessageQueue("dispatch")
+
+	emitter := events.NewEmitter(eventQueue, utxoQueue, services.Nats.SubjectPrefix)
+	defer emitter.Close()
+
+	// start address bloom filter (Initialize is optional)
+	var addressBF addressbloomfilter.WalletAddressBloomFilter
+	if services.Bloomfilter != nil && db != nil {
+		addressBF = addressbloomfilter.NewBloomFilter(*services.Bloomfilter, db, redisClient)
+		if err := addressBF.Initialize(ctx); err != nil {
+			logger.Fatal("Address bloom filter init failed", "err", err)
+		}
+		logger.Info("Address bloom filter initialized")
+	} else if services.Bloomfilter != nil {
+		// Create bloom filter instance even without database, but skip initialization
+		addressBF = addressbloomfilter.NewBloomFilter(*services.Bloomfilter, db, redisClient)
+		logger.Info("Address bloom filter created (initialization skipped - no database)")
+	} else {
+		logger.Info("Address bloom filter skipped - not configured")
+	}
+
+	// If no chains specified, use all configured chains
+	if len(chains) == 0 {
+		chains = cfg.Chains.Names()
+		logger.Info("No chains specified, using all configured chains", "chains", chains)
+	} else {
+		logger.Info("Indexing specified chains", "chains", chains)
+	}
+
+	// Validate chains
+	if err := cfg.Chains.Validate(chains); err != nil {
+		logger.Fatal("Validate chains failed", "err", err)
+	}
+
+	// Override from_latest from CLI if requested
+	if fromLatest {
+		cfg.Chains.OverrideFromLatest(chains)
+		logger.Info("Starting from latest block for all specified chains", "chains", chains)
+	}
+
+	// Build bloom sync config if enabled
+	var bloomSyncCfg *worker.BloomSyncConfig
+	if services.Bloomfilter != nil && services.Bloomfilter.Sync.Enabled && db != nil {
+		c := worker.NewBloomSyncConfig(services.Bloomfilter.Sync)
+		bloomSyncCfg = &c
+	}
+
+	// Create manager with all workers using factory
+	managerCfg := worker.ManagerConfig{
+		Chains:        chains,
+		EnableCatchup: catchup,
+		EnableManual:  manual,
+		BloomSync:     bloomSyncCfg,
+	}
+
+	manager := worker.CreateManagerWithWorkers(
+		ctx,
+		cfg,
+		kvstore,
+		db,
+		addressBF,
+		emitter,
+		redisClient,
+		managerCfg,
+	)
+
+	// Use PORT environment variable if available (standard for PaaS)
+	port := cfg.Services.Port
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := fmt.Sscanf(envPort, "%d", &port); err == nil && p > 0 {
+			logger.Info("Using port from environment variable", "port", port)
+		}
+	}
+
+	healthServer := startHealthServer(port, cfg, db)
+
+	// Start all workers
+	logger.Info("Starting all workers")
+	manager.Start()
+
+	logger.Info("🚀 Transaction indexer is running... Press Ctrl+C to stop")
+	waitForShutdown()
+
+	logger.Info("Shutting down indexer...")
+
+	// Stop workers first so health endpoint can report during drain
+	manager.Stop()
+
+	// Then shutdown health server
+	if healthServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := healthServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("Health server shutdown failed", "error", err)
+		} else {
+			logger.Info("Health server stopped gracefully")
+		}
+	}
+
+	logger.Info("Indexer stopped gracefully")
+}
+
+type HealthResponse struct {
+	Status    string    `json:"status"`
+	Timestamp time.Time `json:"timestamp"`
+	Version   string    `json:"version"`
+}
+
+func startHealthServer(port int, cfg *config.Config, db *gorm.DB) *http.Server {
+	mux := http.NewServeMux()
+
+	version := cfg.Version
+	if version == "" {
+		version = "1.0.0"
+	}
+
+	// ── GET /health ──────────────────────────────────────────────────────────
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		response := HealthResponse{
+			Status:    "ok",
+			Timestamp: time.Now().UTC(),
+			Version:   version,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// ── POST /admin/onboard ──────────────────────────────────────────────────
+	// Creates a new business, derives wallet addresses for all supported chains,
+	// persists both the business and the wallet address rows to the shared DB,
+	// and returns the addresses + webhook secret in the response.
+	if db != nil && cfg.Services.MasterMnemonic != "" {
+		walletRepo := repository.NewRepository[model.WalletAddress](db)
+		businessRepo := repository.NewRepository[model.Business](db)
+
+		onboardSvc, err := onboarding.NewOnboardingService(
+			cfg.Services.MasterMnemonic,
+			businessRepo,
+			walletRepo,
+		)
+		if err != nil {
+			logger.Fatal("Failed to init onboarding service", "err", err)
+		}
+		mux.HandleFunc("/admin/onboard", onboardSvc.HandleOnboard)
+		logger.Info("Onboarding endpoint registered", "path", "/admin/onboard")
+	} else {
+		logger.Info("Onboarding endpoint skipped — database or master_mnemonic not configured")
+	}
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+	}
+
+	go func() {
+		logger.Info("HTTP server started", "port", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("HTTP server failed", "error", err)
+		}
+	}()
+
+	return server
+}
+
+func waitForShutdown() {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+}

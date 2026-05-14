@@ -1,0 +1,80 @@
+# B2B Platform Configuration — Sui USDC (Phase 1)
+env: "development"
+version: "1.0.0"
+
+defaults:
+  from_latest: true
+  quiet_logs: true
+  poll_interval: "2s"
+  reorg_rollback_window: 10
+  client:
+    timeout: "30s"
+    max_retries: 3
+    retry_delay: "1s"
+  throttle:
+    rps: 1
+    burst: 2
+    batch_size: 5
+    concurrency: 1
+
+chains:
+  sui_testnet:
+    network_id: "testnet"
+    internal_code: "sui"
+    type: "sui"
+    confirmations: 1        # checkpoints behind tip before marking confirmed
+    from_latest: true
+    start_offset: 20
+    max_lag: 1000
+    start_block: 328600000
+    poll_interval: "2s"
+    throttle:
+      parallel: true
+      batch_size: 20
+    nodes:
+      - url: "fullnode.testnet.sui.io:443"
+      - url: "sui-testnet.public.blastapi.io:443"
+
+services:
+  port: 8080
+  worker:
+    regular:
+      enabled: true
+    rescanner:
+      enabled: true
+
+  # ── Wallet derivation ──────────────────────────────────────────────────────
+  # The master mnemonic is used to deterministically derive per-business wallet
+  # addresses (BIP-44). Keep this secret and back it up offline.
+  # In production, load from a secrets manager (Vault, AWS Secrets Manager…)
+  master_mnemonic: "${MASTER_MNEMONIC}"
+
+  # ── Message queue ──────────────────────────────────────────────────────────
+  nats:
+    url: "${NATS_URL:-nats://localhost:4222}"
+    subject_prefix: "transfer"
+
+  # ── State / Bloom filter backend ───────────────────────────────────────────
+  redis:
+    url: "${REDIS_URL:-localhost:6379}"
+    password: ""
+
+  # ── Shared database ────────────────────────────────────────────────────────
+  # Both the indexer (read: wallet_addresses for bloom filter) and the
+  # dispatcher (read: businesses + wallet_addresses for webhook routing) connect
+  # to this same PostgreSQL instance.
+  database:
+    url: "${DATABASE_URL:-postgres://indexer:password@localhost:5432/multichain}"
+
+  kvstore:
+    type: "badger"
+    badger:
+      directory: "/tmp/badger"
+      prefix: "indexer"
+
+  bloomfilter:
+    type: "in_memory"
+    batch_size: 1000
+    in_memory:
+      expected_items: 100000
+      false_positive_rate: 0.001

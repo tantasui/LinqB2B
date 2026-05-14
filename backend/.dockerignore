@@ -1,0 +1,6 @@
+.git
+.env
+indexer-linq-b2b
+vendor
+*.log
+bin

@@ -1,0 +1,26 @@
+# Binaries
+b2b-server
+bin/
+
+# Environment
+.env
+.env.local
+
+# Dependencies
+vendor/
+indexer-linq-b2b/
+node_modules/
+Linq-v2/
+
+# IDE
+.vscode/
+.idea/
+*.swpb2b-merchant-main/
+
+
+
+
+
+
+
+

@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>B2B Payment Platform</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @keyframes pulse-badge { 0%,100%{opacity:1} 50%{opacity:.5} }
+    .pulse { animation: pulse-badge 1.5s infinite; }
+    .font-mono { font-family: 'Courier New', monospace; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-sm font-bold">B2</div>
+      <h1 class="text-lg font-semibold">B2B Payment Platform</h1>
+      <span class="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded-full">Sui Testnet</span>
+    </div>
+    <div id="live-dot" class="flex items-center gap-2 text-xs text-gray-400">
+      <span class="w-2 h-2 rounded-full bg-green-400 pulse"></span>
+      Live
+    </div>
+  </header>
+
+  <div class="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-5 gap-8">
+
+    <!-- LEFT: Register + Merchants -->
+    <div class="lg:col-span-2 space-y-6">
+
+      <!-- Register Merchant -->
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+        <h2 class="font-semibold text-sm text-gray-300 mb-4 uppercase tracking-wider">Register Merchant</h2>
+        <form id="register-form" class="space-y-3">
+          <input id="f-name" type="text" placeholder="Business name *"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+          <input id="f-email" type="email" placeholder="Email (optional)"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+          <input id="f-bank" type="text" placeholder="Bank name *"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+          <input id="f-account" type="text" placeholder="Account number *"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+          <p id="register-error" class="text-red-400 text-xs hidden"></p>
+          <button type="submit"
+            class="w-full bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium py-2 rounded-lg transition-colors">
+            Register &amp; Get Sui Address
+          </button>
+        </form>
+      </div>
+
+      <!-- Merchants List -->
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+        <h2 class="font-semibold text-sm text-gray-300 mb-4 uppercase tracking-wider">Merchants
+          <span id="merchant-count" class="ml-2 text-xs text-gray-500"></span>
+        </h2>
+        <div id="merchant-list" class="space-y-3">
+          <p class="text-gray-600 text-sm">No merchants yet.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Deposits Feed -->
+    <div class="lg:col-span-3">
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 h-full">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="font-semibold text-sm text-gray-300 uppercase tracking-wider">Deposit Feed</h2>
+          <span id="deposit-count" class="text-xs text-gray-500"></span>
+        </div>
+        <div id="deposit-list" class="space-y-3 overflow-y-auto max-h-[70vh]">
+          <p class="text-gray-600 text-sm">Waiting for deposits…</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-6 right-6 hidden z-50">
+    <div class="bg-gray-800 border border-gray-700 text-sm px-4 py-3 rounded-xl shadow-xl max-w-sm"></div>
+  </div>
+
+<script>
+const STATUS_COLORS = {
+  received:     'bg-blue-500/20 text-blue-300',
+  processing:   'bg-yellow-500/20 text-yellow-300 pulse',
+  swept:        'bg-purple-500/20 text-purple-300',
+  fiat_pending: 'bg-orange-500/20 text-orange-300 pulse',
+  completed:    'bg-green-500/20 text-green-300',
+};
+const STATUS_LABELS = {
+  received:     '⬇ Received',
+  processing:   '🔄 Sweeping',
+  swept:        '🏦 Swept',
+  fiat_pending: '💱 Fiat Pending',
+  completed:    '✅ Completed',
+};
+
+// ── Register form ─────────────────────────────────────────────────────────────
+document.getElementById('register-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = e.target.querySelector('button[type=submit]');
+  const err = document.getElementById('register-error');
+  err.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Registering…';
+
+  const body = {
+    name:          document.getElementById('f-name').value.trim(),
+    email:         document.getElementById('f-email').value.trim(),
+    bankName:      document.getElementById('f-bank').value.trim(),
+    accountNumber: document.getElementById('f-account').value.trim(),
+  };
+
+  try {
+    const res = await fetch('/api/merchants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(msg.trim());
+    }
+    const m = await res.json();
+    toast(`✅ ${m.name} registered! Sui address: ${short(m.suiAddress)}`);
+    e.target.reset();
+    refreshMerchants();
+  } catch (ex) {
+    err.textContent = ex.message;
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Register & Get Sui Address';
+  }
+});
+
+// ── Merchant list ─────────────────────────────────────────────────────────────
+async function refreshMerchants() {
+  const res = await fetch('/api/merchants').catch(() => null);
+  if (!res || !res.ok) return;
+  const merchants = await res.json();
+  const el = document.getElementById('merchant-list');
+  document.getElementById('merchant-count').textContent = `(${merchants.length})`;
+
+  if (!merchants.length) {
+    el.innerHTML = '<p class="text-gray-600 text-sm">No merchants yet.</p>';
+    return;
+  }
+  el.innerHTML = merchants.map(m => `
+    <div class="bg-gray-800 rounded-lg p-3 space-y-1">
+      <div class="flex items-center justify-between">
+        <span class="font-medium text-sm">${esc(m.name)}</span>
+        <span class="text-xs px-1.5 py-0.5 rounded ${m.status==='active'?'bg-green-500/20 text-green-400':'bg-red-500/20 text-red-400'}">${m.status}</span>
+      </div>
+      <div class="text-xs text-gray-400">${esc(m.bankName)} · ${esc(m.accountNumber)}</div>
+      <div class="flex items-center gap-2 mt-1">
+        <span class="font-mono text-xs text-blue-300 truncate">${m.suiAddress}</span>
+        <button onclick="copy('${m.suiAddress}', this)"
+          class="text-xs text-gray-500 hover:text-gray-200 shrink-0 transition-colors">copy</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ── Deposit feed ──────────────────────────────────────────────────────────────
+let knownIds = new Set();
+
+async function refreshDeposits() {
+  const res = await fetch('/api/deposits').catch(() => null);
+  if (!res || !res.ok) return;
+  const deposits = await res.json();
+  const el = document.getElementById('deposit-list');
+  document.getElementById('deposit-count').textContent = `${deposits.length} total`;
+
+  if (!deposits.length) {
+    el.innerHTML = '<p class="text-gray-600 text-sm">Waiting for deposits…</p>';
+    return;
+  }
+
+  // Toast new arrivals
+  deposits.forEach(d => {
+    if (!knownIds.has(d.id)) {
+      knownIds.add(d.id);
+      if (knownIds.size > 1) { // skip first load
+        toast(`💰 New deposit! ${d.amountUsdc.toFixed(2)} USDC → ${d.merchantName}`);
+      }
+    }
+  });
+
+  el.innerHTML = deposits.map(d => {
+    const cls = STATUS_COLORS[d.status] || 'bg-gray-500/20 text-gray-300';
+    const lbl = STATUS_LABELS[d.status] || d.status;
+    return `
+    <div class="bg-gray-800 rounded-lg p-3 space-y-2">
+      <div class="flex items-center justify-between">
+        <span class="font-medium text-sm">${esc(d.merchantName)}</span>
+        <span class="text-xs px-2 py-0.5 rounded-full font-medium ${cls}">${lbl}</span>
+      </div>
+      <div class="flex items-center justify-between text-xs text-gray-400">
+        <span class="font-mono truncate">${short(d.txHash)}</span>
+        <span class="text-green-300 font-semibold">${d.amountUsdc.toFixed(6)} USDC</span>
+      </div>
+      <div class="text-xs text-gray-600">${new Date(d.createdAt).toLocaleString()}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function short(s) {
+  if (!s) return '';
+  return s.length > 20 ? s.slice(0, 10) + '…' + s.slice(-6) : s;
+}
+
+function esc(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function copy(text, btn) {
+  navigator.clipboard.writeText(text).then(() => {
+    const old = btn.textContent;
+    btn.textContent = 'copied!';
+    setTimeout(() => btn.textContent = old, 1500);
+  });
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.querySelector('div').textContent = msg;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 4000);
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────────
+refreshMerchants();
+refreshDeposits();
+setInterval(refreshMerchants, 5000);
+setInterval(refreshDeposits, 3000);
+</script>
+</body>
+</html>

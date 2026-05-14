@@ -1,0 +1,304 @@
+package worker
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"log/slog"
+
+	"github.com/fystack/multichain-indexer/b2b-platform/internal/indexer"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/common/config"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/common/logger"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/common/types"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/events"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/infra"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/retry"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/store/blockstore"
+	"github.com/fystack/multichain-indexer/b2b-platform/pkg/store/pubkeystore"
+)
+
+// BlockStatus represents the outcome of processing a single block.
+type BlockStatus string
+
+const (
+	BlockStatusProcessed BlockStatus = "processed"
+	BlockStatusNotFound  BlockStatus = "not_found"
+	BlockStatusFailed    BlockStatus = "failed"
+)
+
+// BlockResultObserver is called for every block result when set.
+// It receives the chain name, block number, and the status assigned by the indexer.
+type BlockResultObserver func(chainName string, blockNumber uint64, status BlockStatus)
+
+// BaseWorker holds the common state and logic shared by all worker types.
+type BaseWorker struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	mode   WorkerMode
+	logger *slog.Logger
+
+	config      config.ChainConfig
+	chain       indexer.Indexer
+	kvstore     infra.KVStore
+	blockStore  blockstore.Store
+	pubkeyStore pubkeystore.Store
+	emitter     events.Emitter
+	failedChan  chan FailedBlockEvent
+	observer    BlockResultObserver
+}
+
+// Stop stops the worker and cleans up internal resources
+func (bw *BaseWorker) Stop() {
+	bw.cancel()
+	bw.logger.Info("Worker stopped", "chain", bw.chain.GetName())
+}
+
+// newWorkerWithMode constructs a BaseWorker with the given mode and logger.
+func newWorkerWithMode(
+	ctx context.Context,
+	chain indexer.Indexer,
+	cfg config.ChainConfig,
+	kv infra.KVStore,
+	blockStore blockstore.Store,
+	emitter events.Emitter,
+	pubkeyStore pubkeystore.Store,
+	mode WorkerMode,
+	failedChan chan FailedBlockEvent,
+) *BaseWorker {
+	ctx, cancel := context.WithCancel(ctx)
+	log := logger.With(
+		slog.String("mode", strings.ToUpper(string(mode))),
+		slog.String("chain", chain.GetName()),
+	)
+
+	return &BaseWorker{
+		ctx:         ctx,
+		cancel:      cancel,
+		mode:        mode,
+		logger:      log,
+		config:      cfg,
+		chain:       chain,
+		kvstore:     kv,
+		blockStore:  blockStore,
+		pubkeyStore: pubkeyStore,
+		emitter:     emitter,
+		failedChan:  failedChan,
+	}
+}
+
+// run executes the given job repeatedly at PollInterval with error handling.
+func (bw *BaseWorker) run(job func() error) {
+	ticker := time.NewTicker(bw.config.PollInterval)
+	defer ticker.Stop()
+
+	const retryInterval = 2 * time.Second
+
+	for {
+		select {
+		case <-bw.ctx.Done():
+			bw.logger.Info("Context done, stopping worker loop")
+			return
+
+		case <-ticker.C:
+			start := time.Now()
+
+			// Use Exponential retry for the job
+			if err := retry.Exponential(func() error {
+				return bw.executeRecoverable("worker job", job)
+			}, retry.ExponentialConfig{
+				InitialInterval: retryInterval,
+				MaxElapsedTime:  bw.config.PollInterval * 4,
+				OnRetry: func(err error, next time.Duration) {
+					bw.logger.Debug("Retrying job",
+						"err", err,
+						"next_retry_in", next)
+				},
+			}); err != nil {
+				bw.logger.Error("Job error",
+					"err", err,
+				)
+				_ = bw.emitter.EmitError(bw.chain.GetName(), err)
+			}
+
+			// Maintain minimum PollInterval between job starts
+			if elapsed := time.Since(start); elapsed < bw.config.PollInterval {
+				time.Sleep(bw.config.PollInterval - elapsed)
+			}
+		}
+	}
+}
+
+// notifyObserver calls the observer callback if set.
+func (bw *BaseWorker) notifyObserver(blockNumber uint64, status BlockStatus) {
+	if bw.observer != nil {
+		bw.observer(bw.chain.GetName(), blockNumber, status)
+	}
+}
+
+// handleBlockResult processes a block result and persists/forwards errors if needed.
+func (bw *BaseWorker) handleBlockResult(result indexer.BlockResult) bool {
+	if result.Error != nil {
+		_ = bw.blockStore.SaveFailedBlock(bw.chain.GetNetworkInternalCode(), result.Number)
+
+		// Non-blocking push to failedChan
+		select {
+		case bw.failedChan <- FailedBlockEvent{
+			Chain:   bw.chain.GetName(),
+			Block:   result.Number,
+			Attempt: 1,
+		}:
+		default:
+			bw.logger.Warn("failedChan full, dropping block event", "block", result.Number)
+		}
+
+		bw.logger.Error("Failed to process block",
+			"chain", bw.chain.GetName(),
+			"block", result.Number,
+			"err", result.Error.Message,
+		)
+
+		if result.Error.ErrorType == indexer.ErrorTypeBlockNotFound {
+			bw.notifyObserver(result.Number, BlockStatusNotFound)
+		} else {
+			bw.notifyObserver(result.Number, BlockStatusFailed)
+		}
+		return false
+	}
+
+	if result.Block == nil {
+		bw.logger.Error("Nil block result",
+			"chain", bw.chain.GetName(),
+			"block", result.Number,
+		)
+		bw.notifyObserver(result.Number, BlockStatusFailed)
+		return false
+	}
+
+	// Emit transactions if relevant
+	bw.emitBlock(result.Block)
+
+	if !bw.config.QuietLogs {
+		bw.logger.Info("Processed block successfully",
+			"chain", bw.chain.GetName(),
+			"block", result.Block.Number,
+		)
+	}
+	bw.notifyObserver(result.Number, BlockStatusProcessed)
+	return true
+}
+
+// emitBlock emits relevant transactions for subscribed addresses.
+// When two_way_indexing is enabled, both incoming (to) and outgoing (from) transfers are emitted.
+// For internal transfers where both addresses are monitored, two events are emitted — one per direction.
+func (bw *BaseWorker) emitBlock(block *types.Block) {
+	if block == nil || bw.pubkeyStore == nil {
+		return
+	}
+
+	addressType := bw.chain.GetNetworkType()
+	for _, tx := range block.Transactions {
+		toMonitored := tx.ToAddress != "" && bw.pubkeyStore.Exist(addressType, tx.ToAddress)
+		fromMonitored := false
+		if bw.config.TwoWayIndexing {
+			for _, addr := range tx.AllSenderAddresses() {
+				if bw.pubkeyStore.Exist(addressType, addr) {
+					fromMonitored = true
+					break
+				}
+			}
+		}
+
+		if toMonitored {
+			inTx := tx
+			inTx.Direction = types.DirectionIn
+			bw.logger.Info("Emitting matched transaction",
+				"direction", types.DirectionIn,
+				"from", tx.FromAddress,
+				"to", tx.ToAddress,
+				"chain", bw.chain.GetName(),
+				"type", tx.Type,
+				"txhash", tx.TxHash,
+				"status", tx.Status,
+				"confirmations", tx.Confirmations,
+			)
+			_ = bw.emitter.EmitTransaction(bw.chain.GetName(), &inTx)
+		}
+
+		if fromMonitored {
+			outTx := tx
+			outTx.Direction = types.DirectionOut
+			bw.logger.Info("Emitting matched transaction",
+				"direction", types.DirectionOut,
+				"from", tx.FromAddress,
+				"to", tx.ToAddress,
+				"chain", bw.chain.GetName(),
+				"type", tx.Type,
+				"txhash", tx.TxHash,
+				"status", tx.Status,
+				"confirmations", tx.Confirmations,
+			)
+			_ = bw.emitter.EmitTransaction(bw.chain.GetName(), &outTx)
+		}
+	}
+
+	bw.emitUTXOs(block)
+}
+
+// emitUTXOs emits UTXO events for monitored addresses.
+func (bw *BaseWorker) emitUTXOs(block *types.Block) {
+	if block == nil || bw.pubkeyStore == nil {
+		return
+	}
+
+	if !bw.config.IndexUTXO {
+		return
+	}
+
+	utxoEvents, ok := block.GetMetadata("utxo_events")
+	if !ok {
+		return
+	}
+
+	events, ok := utxoEvents.([]types.UTXOEvent)
+	if !ok {
+		return
+	}
+
+	addressType := bw.chain.GetNetworkType()
+	for i := range events {
+		event := &events[i]
+
+		// Filter to only include UTXOs where the address is in the pubkey store
+		var filteredCreated []types.UTXO
+		for _, utxo := range event.Created {
+			if bw.pubkeyStore.Exist(addressType, utxo.Address) {
+				filteredCreated = append(filteredCreated, utxo)
+			}
+		}
+
+		var filteredSpent []types.SpentUTXO
+		for _, spent := range event.Spent {
+			if bw.pubkeyStore.Exist(addressType, spent.Address) {
+				filteredSpent = append(filteredSpent, spent)
+			}
+		}
+
+		if len(filteredCreated) == 0 && len(filteredSpent) == 0 {
+			continue
+		}
+
+		event.Created = filteredCreated
+		event.Spent = filteredSpent
+
+		bw.logger.Info("Emitting UTXO event",
+			"chain", bw.chain.GetName(),
+			"txhash", event.TxHash,
+			"created", len(event.Created),
+			"spent", len(event.Spent),
+			"status", event.Status,
+			"confirmations", event.Confirmations,
+		)
+		_ = bw.emitter.EmitUTXO(bw.chain.GetName(), event)
+	}
+}

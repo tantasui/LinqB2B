@@ -1,0 +1,59 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build and IDE
+dist
+build
+bin
+.exe
+.exe~
+.dll
+.so
+.dylib
+.idea
+.vscode
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# Dependencies
+node_modules/
+vendor/
+pkg/mod/
+
+# Go specific
+*.test
+*.out
+cover.out
+
+# Frontend specific
+.next
+.nuxt
+.cache
+.vite
+.netlify
+.vercel

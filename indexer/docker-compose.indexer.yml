@@ -1,0 +1,26 @@
+services:
+  transaction-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multichain-indexer
+    container_name: ${CONTAINER_NAME:-transaction-indexer}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Chain configuration - can be overridden via .env file
+      - CHAINS=${CHAINS:-tron_testnet}
+      - DEBUG=${DEBUG:-true}
+      - CATCHUP=${CATCHUP:-true}
+      - MANUAL=${MANUAL:-true}
+
+    volumes:
+      # Mount config file to correct location
+      - ./configs:/app/configs:ro
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+      # Mount data directory for BadgerDB (if using local storage)
+      - ./data:/app/data
+      # Mount certificates directory for TLS/mTLS connections
+      - ./certs:/app/certs:ro
+    command: ["index", "--chains=${CHAINS}", "--debug", "--catchup", "--manual"]
